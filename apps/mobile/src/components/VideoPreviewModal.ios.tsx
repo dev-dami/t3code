@@ -1,9 +1,13 @@
+import * as Dialog from "./ui/Dialog";
 import { useIsFocused } from "@react-navigation/native";
 import { requireNativeModule } from "expo";
+import { settlePromise, squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
+import { AsyncResult } from "effect/reactivity";
 import { useEffect, useEffectEvent, useId, useState } from "react";
-import { Alert, Keyboard } from "react-native";
+import { Keyboard } from "react-native";
 
 import { loadLocalAttachmentPreview } from "../lib/localAttachmentPreview";
+import { fullscreenVideoClosed, fullscreenVideoOpened } from "../lib/videoAudioSession";
 import { mediaVideoPreviewUri, type VideoPreviewSource } from "../lib/videoPreviewSource";
 import { useAssetUrlState, useRefreshAssetUrl } from "../state/assets";
 import { usePreparedConnection } from "../state/session";
@@ -33,16 +37,29 @@ function NativeVideoPreview(props: {
   const resource = source.type === "media" && "resource" in source ? source.resource : null;
   const preparedConnection = usePreparedConnection(environmentId);
   const assetUrl = useAssetUrlState(environmentId, resource);
-  const refreshAssetUrl = useEffectEvent(useRefreshAssetUrl(environmentId, resource));
+  const refreshAssetUrl = useEffectEvent(
+    useRefreshAssetUrl(
+      environmentId,
+      resource,
+      source.type === "media" ? source.fallbackUri : undefined,
+    ),
+  );
   const name = source.type === "media" ? source.name : source.attachment.name;
   // The first minted URL is kept so a background refresh does not restart playback.
   const resolvedUrl =
     source.type === "media"
-      ? mediaVideoPreviewUri(source, assetUrl._tag === "Success" ? assetUrl.url : null)
+      ? mediaVideoPreviewUri(
+          source,
+          assetUrl._tag === "Success"
+            ? assetUrl.url
+            : assetUrl._tag === "Failure"
+              ? (source.fallbackUri ?? null)
+              : null,
+        )
       : null;
   const [playbackUrl, setPlaybackUrl] = useState<string | null>(resolvedUrl);
   const loadError =
-    resource !== null && playbackUrl === null
+    resource !== null && playbackUrl === null && resolvedUrl === null
       ? preparedConnection._tag === "None"
         ? "Reconnect to this environment and open the video again."
         : assetUrl._tag === "Failure"
@@ -52,11 +69,15 @@ function NativeVideoPreview(props: {
 
   useEffect(() => Keyboard.dismiss(), []);
   useEffect(() => {
+    fullscreenVideoOpened();
+    return () => fullscreenVideoClosed();
+  }, []);
+  useEffect(() => {
     if (playbackUrl === null && resolvedUrl !== null) setPlaybackUrl(resolvedUrl);
   }, [playbackUrl, resolvedUrl]);
   useEffect(() => {
     if (!loadError) return;
-    Alert.alert("Could not open video", loadError);
+    Dialog.alert("Could not open video", loadError);
     onRequestClose();
   }, [loadError]);
 
@@ -70,25 +91,28 @@ function NativeVideoPreview(props: {
           ? await loadLocalAttachmentPreview(localAttachment, controller.signal)
           : null;
       if (localAttachment !== null && !file) return;
-      try {
-        if (controller.signal.aborted) return;
-        ready = true;
-        await NativeControls.presentVideo(
+      if (controller.signal.aborted) {
+        file?.dispose();
+        return;
+      }
+      ready = true;
+      const presented = await settlePromise(() =>
+        NativeControls.presentVideo(
           file?.uri ?? playbackUrl!,
           name,
           source.sourceIdentifier ?? "",
           identifier,
-        );
-        if (!controller.signal.aborted) onRequestClose();
-      } finally {
-        // Native completion follows dismissal, so local playback keeps its file lease.
-        file?.dispose();
-      }
+        ),
+      );
+      // Native completion follows dismissal, so local playback keeps its file lease.
+      file?.dispose();
+      if (AsyncResult.isFailure(presented)) throw squashAtomCommandFailure(presented);
+      if (!controller.signal.aborted) onRequestClose();
     })().catch((error: unknown) => {
       if (controller.signal.aborted) return;
       // AVKit gives no retry, so re-mint now; the cached URL may simply have expired.
       if (ready) void refreshAssetUrl();
-      Alert.alert(
+      Dialog.alert(
         "Could not open video",
         ready
           ? "This video couldn't be loaded or played. Check the connection, or touch and hold the video to save or share the original."

@@ -60,9 +60,6 @@ export function useAssetUrlState(
     );
   return deriveAssetUrlState({
     connectionPhase,
-    // A failure left over from an outage is re-queried as soon as the
-    // connection returns. While that re-query is in flight it is not a verdict
-    // on the file, so it reads as loading rather than a false "unavailable".
     shared: shared._tag === "Failure" && result.waiting ? { _tag: "Loading" } : shared,
   });
 }
@@ -79,6 +76,7 @@ export function useAssetUrl(
 export function useRefreshAssetUrl(
   environmentId: EnvironmentId | null,
   resource: AssetResource | null,
+  fallbackUri?: string,
 ): () => Promise<string | null> {
   const connection = usePreparedConnection(environmentId);
   const httpBaseUrl = connection._tag === "Some" ? connection.value.httpBaseUrl : null;
@@ -87,11 +85,16 @@ export function useRefreshAssetUrl(
     reportFailure: false,
   });
   return useCallback(async () => {
-    if (environmentId === null || resource === null || httpBaseUrl === null) return null;
-    const state = assetUrlStateFromResult(
-      await createUrl({ environmentId, input: { resource } }),
-      httpBaseUrl,
-    );
-    return state._tag === "Success" ? state.url : null;
-  }, [createUrl, environmentId, httpBaseUrl, resource]);
+    if (environmentId === null || resource === null || httpBaseUrl === null)
+      return fallbackUri ?? null;
+    let result;
+    try {
+      result = await createUrl({ environmentId, input: { resource } });
+    } catch (error) {
+      if (fallbackUri !== undefined) return fallbackUri;
+      throw error;
+    }
+    const state = assetUrlStateFromResult(result, httpBaseUrl);
+    return state._tag === "Success" ? state.url : (fallbackUri ?? null);
+  }, [createUrl, environmentId, httpBaseUrl, resource, fallbackUri]);
 }

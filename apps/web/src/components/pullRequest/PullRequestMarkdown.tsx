@@ -1,8 +1,11 @@
 import { ExternalLinkIcon, PaperclipIcon } from "lucide-react";
 import { markdownImageSourceFragment } from "@t3tools/client-runtime/markdown-images";
-import { githubMediaFetchUrl } from "@t3tools/shared/githubMedia";
-import type { AssetResource, EnvironmentId, ScopedThreadRef } from "@t3tools/contracts";
-import { createContext, useContext, useMemo } from "react";
+import {
+  pullRequestMediaResource,
+  type PullRequestMediaResource,
+} from "@t3tools/shared/pullRequestMedia";
+import type { EnvironmentId, ScopedThreadRef } from "@t3tools/contracts";
+import { createContext, useContext } from "react";
 import type { Options as ReactMarkdownOptions } from "react-markdown";
 
 import { useAssetUrlRefresh, useAssetUrlState } from "~/assets/assetUrls";
@@ -18,34 +21,25 @@ export const PullRequestMarkdownContext = createContext<{
   threadRef: ScopedThreadRef | null;
 } | null>(null);
 
-/**
- * A video GitHub hosts for the repository. It plays through a signed asset URL the server
- * fetches with the repository's GitHub credential, which is what a private repository's
- * uploads need; the URL is re-signed on retry, so a stale one recovers without a reload.
- */
-function PullRequestGitHubVideo({
+function PullRequestAssetVideo({
   environmentId,
-  cwd,
+  resource,
   url,
-  fetchUrl,
 }: {
   environmentId: EnvironmentId;
-  cwd: string;
-  /** What the body authored, which is what "Open original" should reach. */
+  resource: PullRequestMediaResource;
   url: string;
-  /** The canonical GitHub media URL: a `blob` link addresses the page, not the bytes. */
-  fetchUrl: string;
 }) {
-  const resource = useMemo<AssetResource>(
-    () => ({ _tag: "github-media", cwd, url: fetchUrl }),
-    [cwd, fetchUrl],
-  );
   const assetUrl = useAssetUrlState(environmentId, resource);
   const refreshAssetUrl = useAssetUrlRefresh(environmentId, resource);
-  // A server too old to sign this resource, or one with no route to GitHub, still leaves a
-  // public repository's video playing exactly as it did before.
   const src =
-    assetUrl._tag === "Success" ? assetUrl.url : assetUrl._tag === "Failure" ? fetchUrl : null;
+    assetUrl._tag === "Success"
+      ? assetUrl.url
+      : assetUrl._tag === "Failure"
+        ? resource._tag === "bitbucket-media"
+          ? (url.split("#", 1)[0] ?? url)
+          : resource.url
+        : null;
   return (
     <MediaVideoPlayer
       src={src === null ? null : src + markdownImageSourceFragment(url)}
@@ -53,12 +47,15 @@ function PullRequestGitHubVideo({
       label="Pull request video"
       className="w-full"
       videoClassName="rounded-lg border border-border/60"
-      onRetry={refreshAssetUrl}
+      onRetry={
+        resource._tag === "bitbucket-media" && assetUrl._tag === "Failure"
+          ? undefined
+          : refreshAssetUrl
+      }
     />
   );
 }
 
-/** Renders PR uploads inline, with retry and an original link when video playback fails. */
 export function PullRequestMarkdown({
   text,
   cwd,
@@ -69,7 +66,6 @@ export function PullRequestMarkdown({
   text: string;
   cwd: string;
   environmentId: EnvironmentId;
-  /** Thread the body is shown beside, so its links can open in that thread's in-app browser. */
   threadRef?: ScopedThreadRef | null;
   className?: string;
 }) {
@@ -77,10 +73,9 @@ export function PullRequestMarkdown({
   const context = useContext(PullRequestMarkdownContext);
   const repositoryUrl = context?.repositoryUrl;
   const resolvedThreadRef = threadRef ?? context?.threadRef ?? undefined;
-  const extraRemarkPlugins = useMemo<NonNullable<ReactMarkdownOptions["remarkPlugins"]>>(
-    () => (repositoryUrl ? [[remarkPullRequestAutolinks, { repositoryUrl }]] : []),
-    [repositoryUrl],
-  );
+  const extraRemarkPlugins: NonNullable<ReactMarkdownOptions["remarkPlugins"]> = repositoryUrl
+    ? [[remarkPullRequestAutolinks, { repositoryUrl }]]
+    : [];
   return (
     <div
       className={cn(
@@ -100,19 +95,19 @@ export function PullRequestMarkdown({
               pullRequestPanelRef={resolvedThreadRef ?? PULL_REQUESTS_PANEL_REF}
               environmentId={environmentId}
               extraRemarkPlugins={extraRemarkPlugins}
-              githubMedia
+              pullRequestMedia
             />
           );
         }
-        const githubMediaUrl = segment.media === "video" ? githubMediaFetchUrl(segment.url) : null;
-        if (githubMediaUrl !== null) {
+        const mediaResource =
+          segment.media === "video" ? pullRequestMediaResource(segment.url, cwd) : null;
+        if (mediaResource !== null) {
           return (
-            <PullRequestGitHubVideo
+            <PullRequestAssetVideo
               key={`${segment.id}:${segment.url}`}
               environmentId={environmentId}
-              cwd={cwd}
+              resource={mediaResource}
               url={segment.url}
-              fetchUrl={githubMediaUrl}
             />
           );
         }

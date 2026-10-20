@@ -1,3 +1,4 @@
+import * as Dialog from "./ui/Dialog";
 import { useNavigation } from "@react-navigation/native";
 import {
   useCallback,
@@ -8,8 +9,9 @@ import {
   useSyncExternalStore,
   useMemo,
 } from "react";
-import { Alert, Keyboard } from "react-native";
+import { Keyboard } from "react-native";
 
+import { mediaPreviewUri } from "../lib/mediaPreviewUri";
 import { loadLocalAttachmentPreview } from "../lib/localAttachmentPreview";
 import { useRefreshAssetUrl } from "../state/assets";
 import { filePreviewGallery, filePreviewKey, filePreviewName } from "../lib/filePreviewGallery";
@@ -38,13 +40,14 @@ function PreviewItemResolver(props: {
   const refreshAssetUrl = useRefreshAssetUrl(
     environmentId,
     "resource" in source ? source.resource : null,
+    source.fallbackUri,
   );
   // Resolve once per presentation; background URL refreshes must not reopen the native viewer.
   const [uri, setUri] = useState<string | null>("uri" in source ? source.uri : null);
   const onRequestClose = useEffectEvent(props.onRequestClose);
   const onResolutionError = useEffectEvent((error: unknown, fallbackMessage: string) => {
     if (props.onOpenError) props.onOpenError(error);
-    else Alert.alert("Could not open preview", fallbackMessage);
+    else Dialog.alert("Could not open preview", fallbackMessage);
     onRequestClose();
   });
   useEffect(() => Keyboard.dismiss(), []);
@@ -57,7 +60,7 @@ function PreviewItemResolver(props: {
       .then((url) => {
         if (cancelled) return;
         if (!url) throw new Error("Reconnect to this environment and try again.");
-        setUri(url + (source.srcFragment ?? ""));
+        setUri(mediaPreviewUri(url, source.srcFragment));
       })
       .catch((error: unknown) => {
         if (cancelled) return;
@@ -147,7 +150,7 @@ function ResolvedFilePreview(props: {
 export function FilePreviewModal(props: {
   readonly source: FilePreviewSource | null;
   readonly onRequestClose: () => void;
-  /** Replaces the default alert when the platform cannot open the document. */
+
   readonly onOpenError?: (error: unknown) => void;
 }) {
   const group = useContext(FilePreviewGallery);

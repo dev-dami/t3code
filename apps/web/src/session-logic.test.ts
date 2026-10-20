@@ -90,22 +90,15 @@ describe("V2 session presentation", () => {
       expect(deriveCanInterruptRunningThread(true, runtime)).toBe(true);
     }
 
-    // No active thread: never offer Stop, regardless of run status.
     expect(deriveCanInterruptRunningThread(false, runtimeWithStatus("running", runId))).toBe(false);
 
-    // Queued with nothing interruptible: the server rejects interrupting a
-    // queued run, so Stop stays hidden.
     expect(derivePhase(runtimeWithStatus("queued"))).toBe("connecting");
     expect(deriveCanInterruptRunningThread(true, runtimeWithStatus("queued"))).toBe(false);
-    // Queued behind a run that is still interruptible: Stop targets that run.
     expect(deriveCanInterruptRunningThread(true, runtimeWithStatus("queued", runId))).toBe(true);
 
-    // Waiting (e.g. on a subagent) is treated as "running" by derivePhase and
-    // keeps offering Stop, unchanged from before.
     expect(derivePhase(runtimeWithStatus("waiting"))).toBe("running");
     expect(deriveCanInterruptRunningThread(true, runtimeWithStatus("waiting"))).toBe(true);
 
-    // No runtime at all: nothing to interrupt.
     expect(deriveCanInterruptRunningThread(true, null)).toBe(false);
   });
 
@@ -284,6 +277,7 @@ describe("V2 session presentation", () => {
 
     const targets = deriveRevertTurnCountByUserMessageId({
       timelineEntries,
+      threadStartCheckpointReady: true,
       checkpoints: [
         {
           runId,
@@ -299,6 +293,173 @@ describe("V2 session presentation", () => {
 
     expect([...targets]).toEqual([[turnStartMessageId, 0]]);
     expect(targets.has(steerMessageId)).toBe(false);
+  });
+
+  describe("revert targets after a rewind", () => {
+    const runId = (ordinal: number) => RunId.make(`run-${ordinal}`);
+    const turn = (ordinal: number): TimelineEntry[] =>
+      (["user", "assistant"] as const).map((role) => {
+        const id = MessageId.make(`${role}-${ordinal}`);
+        const createdAt = `2026-06-20T00:00:0${ordinal}.000Z`;
+        return {
+          id,
+          kind: "message",
+          createdAt,
+          message: {
+            id,
+            role,
+            text: role,
+            runId: runId(ordinal),
+            ...(role === "user" ? { inputIntent: "turn_start" as const } : {}),
+            streaming: false,
+            createdAt,
+            updatedAt: createdAt,
+          },
+        };
+      });
+    const checkpoint = (ordinal: number, status: "ready" | "stale" = "ready") => ({
+      runId: runId(ordinal),
+      checkpointTurnCount: ordinal,
+      checkpointRef: `checkpoint-${ordinal}` as never,
+      status,
+      files: [],
+      assistantMessageId: MessageId.make(`assistant-${ordinal}`),
+      completedAt: "2026-06-20T00:00:09.000Z",
+    });
+    const targets = (
+      ordinals: ReadonlyArray<number>,
+      checkpoints: ReadonlyArray<ReturnType<typeof checkpoint>>,
+      options: { threadStartCheckpointReady?: boolean; unsettledRunId?: RunId } = {},
+    ) =>
+      Object.fromEntries(
+        deriveRevertTurnCountByUserMessageId({
+          timelineEntries: ordinals.flatMap(turn),
+          checkpoints,
+          threadStartCheckpointReady: options.threadStartCheckpointReady ?? true,
+          unsettledRunId: options.unsettledRunId ?? null,
+        }),
+      );
+
+    it("keeps rewound and stopped runs editable at the previous visible checkpoint", () => {
+      // Runs 1 and 3 were rewound; run 5 stopped without capturing a checkpoint.
+      expect(targets([2, 4, 5], [checkpoint(2), checkpoint(3, "stale"), checkpoint(4)])).toEqual({
+        "user-2": 0,
+        "user-4": 2,
+        "user-5": 4,
+      });
+      expect(targets([2], [checkpoint(1, "stale")])).toEqual({ "user-2": 0 });
+    });
+
+    it("preserves a notification-only wake run while ignoring inherited and unrelated work", () => {
+      const fixture = makeStreamingTimelineFixture();
+      const first = fixture.visibleTurnItems[0]!;
+      if (first.item.type !== "user_message") throw new Error("Expected a user message fixture.");
+      const notification = {
+        ...first,
+        item: {
+          ...first.item,
+          id: TurnItemId.make("wake-item"),
+          runId: runId(2),
+          type: "notification" as const,
+          source: { kind: "delegated_task" as const, taskIds: [NodeId.make("task-1")] },
+          outcome: "unknown" as const,
+          summary: "Delegated task finished",
+        },
+      };
+      const inherited = {
+        ...notification,
+        visibility: "inherited" as const,
+        sourceThreadId: ThreadId.make("parent-thread"),
+        sourceItemId: TurnItemId.make("inherited-wake"),
+        item: {
+          ...notification.item,
+          id: TurnItemId.make("inherited-wake"),
+          threadId: ThreadId.make("parent-thread"),
+          runId: runId(7),
+        },
+      };
+      const work: TimelineEntry = {
+        id: "background-work",
+        kind: "work",
+        createdAt: "2026-06-20T00:00:02.000Z",
+        entry: {
+          id: "background-work",
+          createdAt: "2026-06-20T00:00:02.000Z",
+          runId: runId(8),
+          itemType: "command_execution",
+          label: "Background work",
+          tone: "tool",
+        },
+      };
+
+      expect(
+        Object.fromEntries(
+          deriveRevertTurnCountByUserMessageId({
+            timelineEntries: [
+              ...turn(1),
+              ...deriveTimelineEntriesFromVisibleTurnItems({
+                visibleTurnItems: [notification, inherited],
+                optimisticMessages: [],
+              }),
+              work,
+              ...turn(3),
+            ],
+            checkpoints: [
+              checkpoint(1),
+              checkpoint(2),
+              checkpoint(3),
+              checkpoint(7),
+              checkpoint(8),
+            ],
+            threadStartCheckpointReady: true,
+          }),
+        ),
+      ).toEqual({ "user-1": 0, "user-3": 2 });
+    });
+
+    it("hides edit when the predecessor is unavailable or the run is unsettled", () => {
+      expect(targets([1, 2], [checkpoint(2)])).toEqual({ "user-1": 0 });
+      expect(targets([1, 2], [checkpoint(1, "stale"), checkpoint(2)])).toEqual({ "user-1": 0 });
+      // Earlier history is paged out, so the first loaded run's predecessor is unknown.
+      expect(
+        targets([4, 5], [checkpoint(4), checkpoint(5)], { threadStartCheckpointReady: false }),
+      ).toEqual({ "user-5": 4 });
+      expect(targets([1, 2], [checkpoint(1), checkpoint(2)], { unsettledRunId: runId(2) })).toEqual(
+        { "user-1": 0 },
+      );
+    });
+
+    it("can edit a cancelled run but cannot target its checkpoint without a provider turn", () => {
+      expect(
+        Object.fromEntries(
+          deriveRevertTurnCountByUserMessageId({
+            timelineEntries: [1, 2, 3].flatMap(turn),
+            checkpoints: [checkpoint(1), checkpoint(2), checkpoint(3)],
+            threadStartCheckpointReady: true,
+            availableRevertTurnCounts: new Set([0, 1]),
+          }),
+        ),
+      ).toEqual({ "user-1": 0, "user-2": 1 });
+    });
+
+    it("leaves inherited history uneditable and restores the first local run to thread start", () => {
+      const fixture = makeStreamingTimelineFixture();
+      const inheritedEntries = deriveTimelineEntriesFromVisibleTurnItems({
+        visibleTurnItems: fixture.visibleTurnItems
+          .filter(({ item }) => item.runId === fixture.historyRunId)
+          .map((item) => ({ ...item, visibility: "inherited" as const })),
+        optimisticMessages: [],
+      });
+      expect(
+        Object.fromEntries(
+          deriveRevertTurnCountByUserMessageId({
+            timelineEntries: [...inheritedEntries, ...turn(2)],
+            checkpoints: [{ ...checkpoint(7), runId: fixture.historyRunId }, checkpoint(2)],
+            threadStartCheckpointReady: true,
+          }),
+        ),
+      ).toEqual({ "user-2": 0 });
+    });
   });
 
   it("uses visible turn item order and keeps provider errors in the work log", () => {
@@ -578,9 +739,6 @@ describe("V2 session presentation", () => {
     const entry = entries[0];
     expect(entry?.kind).toBe("work");
     if (entry?.kind === "work") {
-      // An exit-code failure is still an ordinary tool row: the failed
-      // lifecycle status carries the marker, and an "error" tone here would
-      // knock the whole group out of the "Ran N commands" summary.
       expect(entry.entry.tone).toBe("tool");
       expect(entry.entry.toolLifecycleStatus).toBe("failed");
     }
@@ -1039,7 +1197,6 @@ describe("native provider presentation in the v2 timeline", () => {
       kind: "work",
       entry: { questionAnswer: question.questionAnswer },
     });
-    // A separately paged reply stays visible until its question history is available.
     expect(
       deriveTimelineEntriesFromVisibleTurnItems({ ...input, visibleTurnItems: [visible(reply)] })[0]
         ?.kind,
